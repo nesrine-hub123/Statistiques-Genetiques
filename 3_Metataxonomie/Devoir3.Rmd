@@ -1,0 +1,587 @@
+---
+title: "Devoir 3 - Métataxonomie"
+author: "Jérôme Fortin, Nicolas Campeau, Daniel Ilboudo, Nesrine Imloul, Juliette Pourrain"
+date: "25 avril 2025"
+output: 
+  html_document: 
+    toc: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+Charger les paquetages nécessaires
+
+```{r library}
+library(dada2)
+library(phyloseq)
+library(DESeq2)
+library(phangorn)
+library(vegan)
+library(ggplot2)
+library(ggpubr)
+library(DECIPHER)
+library(car)
+```
+
+# 1) Faire l’inférence des variants d’amplicons séquencés avec DADA2
+
+## Préparation
+
+Charger les fichiers de lectures de séquençage brutes (READS)
+
+```{r path_to_reads}
+# Utiliser l'arborescence suivante :
+# ./
+# ├── Devoir3.Rmd
+# └── data/
+#     ├── READS_DEVOIR3/
+#     │   ├── ...
+#     │   ├── *.fastq.gz
+#     ├── metadata_file.txt
+#     ├── silva_nr_v132_train_set.fa.gz
+#     └── silva_species_assignment_v132.fa.gz
+
+path_to_data <- "~/Documents/BIF-4002/Devoir3/data" # À modifier
+path_to_reads <- file.path(path_to_data, "READS_DEVOIR3")
+list.files(path_to_reads)
+```
+
+Définir des listes spécifiques afin de distinguer le sens des lectures
+
+```{r filenames}
+forward_filenames <- sort(list.files(path_to_reads, 
+                                     pattern = "_R1_001.fastq.gz", 
+                                     full.names = TRUE))
+reverse_filenames <- sort(list.files(path_to_reads, 
+                                     pattern = "_R2_001.fastq.gz", 
+                                     full.names = TRUE))
+sample.names <- sapply(strsplit(basename(forward_filenames), "_"), `[`, 1)
+```
+
+## Contrôle qualité
+
+Visualiser la qualité des séquences
+
+```{r quality_profile}
+plotQualityProfile(forward_filenames)
+plotQualityProfile(reverse_filenames)
+```
+
+Définir les noms des fichiers correspondant aux séquences filtrées
+
+```{r sample_names}
+forward_filtered <- file.path(path_to_reads, "filtered", 
+                              paste0(sample.names, "_F_filt.fastq.gz"))
+reverse_filtered <- file.path(path_to_reads, "filtered", 
+                              paste0(sample.names, "_R_filt.fastq.gz"))
+names(forward_filtered) <- sample.names
+names(reverse_filtered) <- sample.names
+```
+
+Effectuer le contrôle qualité des séquences
+
+```{r filter_and_trim}
+# Score phred de 20-25 comme limite pour la troncation
+# Modifier le paramètre multithread en fonction de votre CPU
+output_filter <- filterAndTrim(forward_filenames, forward_filtered, 
+                               reverse_filenames, reverse_filtered, 
+                               truncLen = c(290, 250), maxN = 0, 
+                               maxEE = c(2, 2), truncQ = 2, rm.phix = TRUE, 
+                               compress = TRUE, multithread = 12)
+output_filter
+```
+
+## Construction des modèles d'erreurs (très long)
+
+```{r errors, results = "hide"}
+# Modifier le paramètre multithread en fonction de votre CPU
+forward_errors <- learnErrors(forward_filtered, multithread = 12)
+reverse_errors <- learnErrors(reverse_filtered, multithread = 12)
+plotErrors(forward_errors, nominalQ = TRUE)
+plotErrors(reverse_errors, nominalQ = TRUE)
+```
+
+## Inférence des variants d'amplicons
+
+```{r dada, results = "hide"}
+forward_dereplicated <- derepFastq(forward_filtered)
+reverse_dereplicated <- derepFastq(reverse_filtered)
+
+# Modifier le paramètre multithread en fonction de votre CPU
+forward_dada <- dada(forward_dereplicated, err = forward_errors, 
+                     multithread = 12)
+reverse_dada <- dada(reverse_dereplicated, err = reverse_errors, 
+                     multithread = 12)
+```
+
+## Construction du tableau d'abondances d'OTUs / ASVs
+
+Construire le tableau d'abondances
+
+```{r seqtab}
+mergers <- mergePairs(forward_dada, forward_dereplicated, reverse_dada, 
+                      reverse_dereplicated, verbose = F)
+seqtab <- makeSequenceTable(mergers)
+freq <- table(nchar(getSequences(seqtab)))
+plot(freq, type = 'l', xlab = "Longueur de séquence", ylab = "Fréquence")
+```
+
+Supprimer les chimères et vérification finale
+
+```{r seqtab_nochim}
+# Modifier le paramètre multithread en fonction de votre CPU
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", 
+                                    multithread = 12)
+freq.nochim <- table(nchar(getSequences(seqtab.nochim)))
+plot(freq.nochim, type = 'l', xlab = "Longueur de séquence", 
+     ylab = "Fréquence")
+```
+
+Garder les ASVs / OTUs qui ne sont pas issus d'une lecture seule
+
+```{r seqtab_nochim_nosingle}
+seqtab.nochim.nchar <- nchar(colnames(seqtab.nochim)) >= 270
+seqtab.nochim.nosingle <- as.data.frame(seqtab.nochim)[, seqtab.nochim.nchar]
+seqtab.nochim.nosingle <- as.matrix(seqtab.nochim.nosingle)
+```
+
+Vérifier le nombre de reads à chaque étape
+
+```{r track}
+getN <- function(x) sum(getUniques(x))
+track <- cbind(output_filter, sapply(forward_dada, getN), 
+               sapply(reverse_dada, getN), sapply(mergers, getN), 
+               rowSums(seqtab.nochim), rowSums(seqtab.nochim.nosingle))
+colnames(track) <- c("initial", "post-filtration", "denoisedF", "denoisedR", 
+                     "merged", "sans-chimères", 
+                     "sans-chimères-sans-lecture-seule")
+rownames(track) <- sample.names
+```
+
+## Annotation taxonomique
+
+```{r taxonomy}
+# Modifier le paramètre multithread en fonction de votre CPU
+taxonomy <- assignTaxonomy(seqtab.nochim.nosingle, 
+                           file.path(path_to_data, 
+                                     "silva_nr_v132_train_set.fa.gz"), 
+                           multithread = 12)
+taxonomy <- addSpecies(taxonomy, 
+                       file.path(path_to_data, 
+                                 "silva_species_assignment_v132.fa.gz"), 
+                       allowMultiple = TRUE, n = 1e3)
+```
+
+# 2) Visualiser les OTUs / ASVs les plus abondants du jeu de données
+
+## Préparation
+
+Construire l'objet Phyloseq
+
+```{r phyloseq}
+metadata_df <- read.delim(file.path(path_to_data, "metadata_file.txt"), 
+                          sep = "\t", header = TRUE, row.names = 1)
+metadata_df <- metadata_df[rownames(metadata_df) %in% sample.names, ]
+my_phyloseq <- phyloseq(otu_table(seqtab.nochim, taxa_are_rows = FALSE), 
+                        sample_data(metadata_df), tax_table(taxonomy))
+```
+
+Constuire l'arbre phylogénétique des séquences d'ASVs
+
+```{r phy_tree}
+dna_seqs <- Biostrings::DNAStringSet(taxa_names(my_phyloseq))
+names(dna_seqs) <- taxa_names(my_phyloseq)
+aligned_dna_seqs <- AlignSeqs(dna_seqs, verbose = FALSE)
+dna_phyDat <- as.phyDat(as.DNAbin(aligned_dna_seqs))
+phy_tree(my_phyloseq) <- NJ(dist.ml(dna_phyDat))
+```
+
+Renommer les séquences associées
+
+```{r taxa_names}
+my_phyloseq <- merge_phyloseq(my_phyloseq, dna_seqs)
+taxa_names(my_phyloseq) <- paste0("ASV", seq(ntaxa(my_phyloseq)))
+```
+
+Normaliser les abondances
+
+```{r phyloseq_relative}
+my_phyloseq.relative <- transform_sample_counts(my_phyloseq, 
+                                                function(OTU) OTU / sum(OTU))
+top30 <- names(sort(taxa_sums(my_phyloseq), decreasing = TRUE))[1:30]
+my_phyloseq.top30 <- prune_taxa(top30, my_phyloseq.relative)
+```
+
+## Visualiser les 30 ASVs / OTUs les plus abondants
+
+Visualiser par ordre
+
+```{r top30_order}
+plot_bar(my_phyloseq.top30, fill = "Order") + 
+  facet_wrap(~ Population, scales = "free_x")
+```
+
+Visualiser par famille
+
+```{r top30_family}
+plot_bar(my_phyloseq.top30, fill = "Family") + 
+  facet_wrap(~ Population, scales = "free_x")
+```
+
+Visualiser par genre
+
+```{r top30_genus}
+plot_bar(my_phyloseq.top30, fill = "Genus") + 
+  facet_wrap(~ Population, scales = "free_x")
+```
+
+## Visualiser la répartition par population
+
+Répartir les échantillons par population
+
+```{r subset_samples}
+MC_phyloseq <- subset_samples(my_phyloseq.relative, 
+                              Population == "Malbaie_Captive")
+MW_phyloseq <- subset_samples(my_phyloseq.relative, 
+                              Population == "Malbaie_Wild")
+RC_phyloseq <- subset_samples(my_phyloseq.relative, 
+                              Population == "Rimouski_Captive")
+RW_phyloseq <- subset_samples(my_phyloseq.relative, 
+                              Population == "Rimouski_Wild")
+
+top20.MC <- names(sort(taxa_sums(MC_phyloseq), decreasing = TRUE))[1:20]
+top20.MW <- names(sort(taxa_sums(MW_phyloseq), decreasing = TRUE))[1:20]
+top20.RC <- names(sort(taxa_sums(RC_phyloseq), decreasing = TRUE))[1:20]
+top20.RW <- names(sort(taxa_sums(RW_phyloseq), decreasing = TRUE))[1:20]
+
+MC.top20 <- prune_taxa(top20.MC, MC_phyloseq)
+MW.top20 <- prune_taxa(top20.MW, MW_phyloseq)
+RC.top20 <- prune_taxa(top20.RC, RC_phyloseq)
+RW.top20 <- prune_taxa(top20.RW, RW_phyloseq)
+```
+
+Visualiser par ordre
+
+```{r top20_order}
+MC.barplot_order <- plot_bar(MC.top20, fill = "Order", 
+                             title = "Malbaie_Captive") + 
+  scale_y_continuous(limits = c(0, 1))
+MW.barplot_order <- plot_bar(MW.top20, fill = "Order", 
+                             title = "Malbaie_Wild") + 
+  scale_y_continuous(limits = c(0, 1))
+RC.barplot_order <- plot_bar(RC.top20, fill = "Order", 
+                             title = "Rimouski_Captive") +
+  scale_y_continuous(limits = c(0, 1))
+RW.barplot_order <- plot_bar(RW.top20, fill = "Order", 
+                             title = "Rimouski_Wild") + 
+  scale_y_continuous(limits = c(0, 1))
+ggarrange(MC.barplot_order, MW.barplot_order, RC.barplot_order, 
+          RW.barplot_order, labels = c("A", "B","C", "D"), ncol = 2, nrow = 2)
+```
+
+Visualiser par famille
+
+```{r top20_family}
+MC.barplot_family <- plot_bar(MC.top20, fill = "Family", 
+                              title = "Malbaie_Captive") + 
+  scale_y_continuous(limits = c(0, 1))
+MW.barplot_family <- plot_bar(MW.top20, fill = "Family", 
+                              title = "Malbaie_Wild") + 
+  scale_y_continuous(limits = c(0, 1))
+RC.barplot_family <- plot_bar(RC.top20, fill = "Family", 
+                              title = "Rimouski_Captive") +
+  scale_y_continuous(limits = c(0, 1))
+RW.barplot_family <- plot_bar(RW.top20, fill = "Family", 
+                              title = "Rimouski_Wild") + 
+  scale_y_continuous(limits = c(0, 1))
+ggarrange(MC.barplot_family, MW.barplot_family, RC.barplot_family, 
+          RW.barplot_family, labels = c("A", "B","C", "D"), ncol = 2, nrow = 2)
+```
+
+Visualiser par genre
+
+```{r top20_genus}
+MC.barplot_genus <- plot_bar(MC.top20, fill = "Genus", 
+                             title = "Malbaie_Captive") + 
+  scale_y_continuous(limits = c(0, 1))
+MW.barplot_genus <- plot_bar(MW.top20, fill = "Genus", 
+                             title = "Malbaie_Wild") + 
+  scale_y_continuous(limits = c(0, 1))
+RC.barplot_genus <- plot_bar(RC.top20, fill = "Genus", 
+                             title = "Rimouski_Captive") +
+  scale_y_continuous(limits = c(0, 1))
+RW.barplot_genus <- plot_bar(RW.top20, fill = "Genus", 
+                             title = "Rimouski_Wild") + 
+  scale_y_continuous(limits = c(0, 1))
+ggarrange(MC.barplot_genus, MW.barplot_genus, RC.barplot_genus, 
+          RW.barplot_genus, labels = c("A", "B","C", "D"), ncol = 2, nrow = 2)
+```
+
+# 3) Visualiser la diversité alpha des échantillons et vérifier statistiquement la présence de différences significatives
+
+## Graphiques de diversité alpha
+
+```{r richness}
+plot_richness(my_phyloseq, x = "Population", 
+              measures = c("Shannon", "Simpson", "InvSimpson", "Chao1"), 
+              color = "Population", title = "Graphiques de diversité alpha")
+```
+
+## Tests statistiques
+
+Chercher les valeurs de diversité alpha et ajouter les métadonnées
+
+```{r estimate_richness}
+test_names <- c("Chao1", "Shannon", "InvSimpson", "Fisher")
+alpha_data <- estimate_richness(my_phyloseq, measures = test_names)
+alpha_data <- merge(x = alpha_data, y = metadata_df, by = "row.names")
+rownames(alpha_data) <- alpha_data$Row.names
+```
+
+Test de Shapiro-Wilk (normalité)
+
+```{r shapiro}
+shapiro.test(alpha_data$Chao1)
+shapiro.test(alpha_data$Shannon)
+shapiro.test(alpha_data$InvSimpson)
+shapiro.test(alpha_data$Fisher)
+```
+
+Test de Levene (homogénéité des variances)
+
+```{r levene}
+for (test in test_names)
+{
+  test_formula <- paste(test, "~", "Population")
+  print(paste("Test de l'homogénéité de la variance :", test))
+  print(leveneTest(as.formula(test_formula), data = alpha_data))
+}
+```
+
+ANOVA (si les deux postulats sont respectés)
+
+```{r anova}
+for (test in test_names)
+{
+  test_formula <- paste(test, "~", "Population")
+  aov.Type <- aov(formula = as.formula(test_formula), data = alpha_data)
+  print(paste("Mesure de diversité alpha :", test))
+  print(summary(aov.Type))
+  print(TukeyHSD(aov.Type))
+}
+```
+
+Test de Kruskal-Wallis (non paramétrique)
+
+```{r kruskal}
+for (test in test_names)
+{
+  test_formula <- paste(test, "~", "Population")
+  print(paste("Mesure de diversité alpha :", test))
+  print(kruskal.test(as.formula(test_formula), data = alpha_data))
+}
+```
+
+Test de Wilcoxon (non paramétrique)
+
+```{r wilcoxon}
+for (test in test_names)
+{
+  test_formula <- paste(test, "~", "Population")
+  print(paste("Mesure de diversité alpha :", test))
+  print(pairwise.wilcox.test(alpha_data[, test], alpha_data$Population, 
+                             p.adjust.method = "fdr"))
+}
+```
+
+# 4) Visualiser la diversité béta des échantillons et vérifier statistiquement la présence de différences significatives avec une PERMANOVA (ADONIS)
+
+## Graphiques de Diversité Beta
+
+NMDS
+
+```{r nmds, results = "hide"}
+ordination.nmds.bray <- ordinate(my_phyloseq.relative, method = "NMDS", 
+                                 distance = "bray")
+ordination.nmds.unifrac <- ordinate(my_phyloseq.relative, method = "NMDS", 
+                                    distance = "unifrac")
+ordination.nmds.wunifrac <- ordinate(my_phyloseq.relative, method = "NMDS", 
+                                     distance = "unifrac", weighted = TRUE)
+
+NMDS.bray.plot <- plot_ordination(my_phyloseq.relative, ordination.nmds.bray, 
+                                  color = "Population", 
+                                  title = "Bray NMDS by sample") + 
+  stat_ellipse(level = 0.95)
+NMDS.UniFrac.plot <- plot_ordination(my_phyloseq.relative, 
+                                     ordination.nmds.unifrac, 
+                                     color = "Population", 
+                                     title = "Unifrac NMDS by sample") + 
+  stat_ellipse(level = 0.95)
+NMDS.WUniFrac.plot <- plot_ordination(my_phyloseq.relative, 
+                                      ordination.nmds.wunifrac, 
+                                      color = "Population", 
+                                      title = "Weighted Unifrac NMDS by 
+                                      sample") + 
+  stat_ellipse(level = 0.95)
+ggarrange(NMDS.bray.plot , ggarrange(NMDS.UniFrac.plot, NMDS.WUniFrac.plot, 
+                                     ncol = 2), 
+          labels = c("A", "B"), nrow = 2)
+```
+
+PCoA
+
+```{r pcoa}
+ordination.pcoa.bray <- ordinate(my_phyloseq.relative, method = "PCoA", 
+                                 distance = "bray")
+ordination.pcoa.unifrac = ordinate(my_phyloseq.relative, method = "PCoA",
+                                   distance = "unifrac")
+ordination.pcoa.wunifrac = ordinate(my_phyloseq.relative, method = "PCoA", 
+                                    distance = "unifrac", weighted = TRUE)
+
+PCOA.bray.plot <- plot_ordination(my_phyloseq.relative, ordination.pcoa.bray, 
+                                  color = "Population", 
+                                  title = "Bray PCoA by sample") + 
+  stat_ellipse(level = 0.95)
+PCOA.UniFrac.plot <- plot_ordination(my_phyloseq.relative, 
+                                     ordination.pcoa.unifrac, 
+                                     color = "Population", 
+                                     title = "Unifrac PCoA by sample") +  
+  stat_ellipse(level = 0.95)
+PCOA.WUniFrac.plot <- plot_ordination(my_phyloseq.relative, 
+                                      ordination.pcoa.wunifrac, 
+                                      color = "Population", 
+                                      title = "Weighted Unifrac PCoA by 
+                                      sample") + 
+  stat_ellipse(level = 0.95)
+ggarrange(PCOA.bray.plot , ggarrange(PCOA.UniFrac.plot, PCOA.WUniFrac.plot, 
+                                     ncol = 2, common.legend = TRUE, 
+                                     legend = "right"), 
+          labels = c("A", "B"), nrow = 2, legend = "right")
+```
+
+## PERMANOVA sur les matrices de diversité bêta (ADONIS)
+
+Extraire les matrices de diversité bêta
+
+```{r distances}
+distance.matrix.unifrac <- UniFrac(my_phyloseq.relative)
+distance.matrix.wunifrac <- UniFrac(my_phyloseq.relative, weighted = TRUE)
+distance.matrix.bray <- phyloseq::distance(my_phyloseq.relative, 
+                                           method = "bray")
+```
+
+ADONIS
+
+```{r adonis}
+adonis(distance.matrix.unifrac ~ Population, data = metadata_df,
+       permutations = 1000)[-5]
+adonis(distance.matrix.wunifrac ~ Population, data = metadata_df,
+       permutations = 1000)[-5]
+adonis(distance.matrix.bray ~ Population, data = metadata_df,
+       permutations = 1000)[-5]
+```
+
+# 5) Faire un jeu de données avec un sous-échantillion des 100 ASVs les plus abondants
+
+## Graphiques de Diversité Beta
+
+Extraire les 100 ASVs les plus abondants
+
+```{r top100}
+top100 <- names(sort(taxa_sums(my_phyloseq.relative), decreasing = TRUE))[1:100]
+my_phyloseq.top100 <- prune_taxa(top100, my_phyloseq.relative)
+```
+
+NMDS
+
+```{r nmds_top100, results = "hide"}
+ordination.nmds.bray.top100 <- ordinate(my_phyloseq.top100, method = "NMDS", 
+                                        distance = "bray")
+ordination.nmds.unifrac.top100 <- ordinate(my_phyloseq.top100, method = "NMDS", 
+                                           distance = "unifrac")
+ordination.nmds.wunifrac.top100 <- ordinate(my_phyloseq.top100, method = "NMDS", 
+                                            distance = "unifrac", 
+                                            weighted = TRUE)
+
+NMDS.bray.plot.top100 <- plot_ordination(my_phyloseq.top100, 
+                                         ordination.nmds.bray, 
+                                         color = "Population", 
+                                         title = "Bray NMDS by sample") + 
+  stat_ellipse(level = 0.95)
+NMDS.UniFrac.plot.top100 <- plot_ordination(my_phyloseq.top100, 
+                                            ordination.nmds.unifrac, 
+                                            color = "Population", 
+                                            title = "Unifrac NMDS by sample") + 
+  stat_ellipse(level = 0.95)
+NMDS.WUniFrac.plot.top100 <- plot_ordination(my_phyloseq.top100, 
+                                             ordination.nmds.wunifrac, 
+                                             color = "Population", 
+                                             title = "Weighted Unifrac NMDS by 
+                                             sample") + 
+  stat_ellipse(level = 0.95)
+ggarrange(NMDS.bray.plot.top100, ggarrange(NMDS.UniFrac.plot.top100, 
+                                           NMDS.WUniFrac.plot.top100, ncol = 2), 
+          labels = c("A", "B"), nrow = 2)
+```
+
+PCoA
+
+```{r pcoa_top100}
+ordination.pcoa.bray.top100 <- ordinate(my_phyloseq.top100, method = "PCoA", 
+                                        distance = "bray")
+ordination.pcoa.unifrac.top100 <- ordinate(my_phyloseq.top100, method = "PCoA", 
+                                           distance = "unifrac")
+ordination.pcoa.wunifrac.top100 <- ordinate(my_phyloseq.top100, method = "PCoA", 
+                                            distance = "unifrac", 
+                                            weighted = TRUE)
+
+PCOA.bray.plot.top100 <- plot_ordination(my_phyloseq.top100, 
+                                         ordination.pcoa.bray, 
+                                         color = "Population", 
+                                         title = "Bray PCoA by sample") + 
+  stat_ellipse(level = 0.95)
+PCOA.UniFrac.plot.top100 <- plot_ordination(my_phyloseq.top100, 
+                                            ordination.pcoa.unifrac, 
+                                            color = "Population", 
+                                            title = "Unifrac PCoA by sample") +  
+  stat_ellipse(level = 0.95)
+PCOA.WUniFrac.plot.top100 <- plot_ordination(my_phyloseq.top100, 
+                                             ordination.pcoa.wunifrac, 
+                                             color = "Population", 
+                                             title = "Weighted Unifrac PCoA by 
+                                             sample") + 
+  stat_ellipse(level = 0.95)
+ggarrange(PCOA.bray.plot.top100, ggarrange(PCOA.UniFrac.plot.top100, 
+                                           PCOA.WUniFrac.plot.top100, ncol = 2, 
+                                           common.legend = TRUE, 
+                                           legend = "right"), 
+          labels = c("A", "B"), nrow = 2, legend = "right")
+```
+
+## PERMANOVA sur les matrices de diversité bêta (ADONIS)
+
+Extraire les matrices de diversité bêta
+
+```{r distances_top100}
+distance.matrix.unifrac.top100 <- UniFrac(my_phyloseq.top100)
+distance.matrix.wunifrac.top100 <- UniFrac(my_phyloseq.top100, weighted = TRUE)
+distance.matrix.bray.top100 <- phyloseq::distance(my_phyloseq.top100, 
+                                                  method = "bray")
+```
+
+ADONIS
+
+```{r adonis_top100}
+adonis(distance.matrix.unifrac.top100 ~ Population, data = metadata_df,
+       permutations = 1000)[-5]
+adonis(distance.matrix.wunifrac.top100 ~ Population, data = metadata_df,
+       permutations = 1000)[-5]
+adonis(distance.matrix.bray.top100 ~ Population, data = metadata_df,
+       permutations = 1000)[-5]
+```
+
+```{r save, echo = FALSE}
+save.image(file.path(path_to_data, "Workspace_knit_Run.RData"))
+```
