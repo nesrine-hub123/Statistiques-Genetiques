@@ -1,4 +1,4 @@
-# 🌿  Analyse phylogénétique
+#  Analyse phylogénétique
 
 **Cours :** BIF-4002 — Statistiques génétiques : concepts et analyse  
 **Université Laval — Hiver 2025**  
@@ -6,7 +6,7 @@
 
 ---
 
-## 🔬 Contexte
+##  Contexte
 
 Ce projet porte sur la **reconstruction phylogénétique** à partir de séquences d’ADN.  
 L’objectif est d’analyser les **relations évolutives entre différentes populations ou espèces**, en comparant les séquences de gènes homologues et en utilisant un **groupe externe** pour enraciner les arbres.
@@ -15,7 +15,7 @@ Cette approche permet de mieux comprendre les liens de parenté, les événement
 
 ---
 
-## 🎯 Objectifs
+## Objectifs
 
 - Aligner les séquences nucléotidiques et identifier les régions homologues.  
 - Construire des **arbres phylogénétiques** à l’aide de méthodes statistiques robustes.  
@@ -24,7 +24,7 @@ Cette approche permet de mieux comprendre les liens de parenté, les événement
 
 ---
 
-## ⚙️ Méthodologie
+##  Méthodologie
 
 1. **Préparation des séquences**
    - Importation des séquences en format FASTA.  
@@ -44,7 +44,7 @@ Cette approche permet de mieux comprendre les liens de parenté, les événement
 
 ---
 
-## 📈 Résultats
+##  Résultats
 
 - Les arbres obtenus montrent une bonne séparation entre les groupes internes et le groupe externe.  
 - Les valeurs de **bootstrap > 80 %** confirment la stabilité de la majorité des clades.  
@@ -52,7 +52,7 @@ Cette approche permet de mieux comprendre les liens de parenté, les événement
 
 ---
 
-## 🧠 Logiciels utilisés
+##  Logiciels utilisés
 
 - **MEGA X** — alignement et inférence phylogénétique  
 - **ClustalW / MUSCLE** — alignement multiple des séquences  
@@ -61,7 +61,7 @@ Cette approche permet de mieux comprendre les liens de parenté, les événement
 
 ---
 
-## 📁 Fichiers du dossier
+##  Fichiers du dossier
 
 - `Devoir2.html` — visualisation interactive de l’arbre obtenu  
 - `Phylogénétique_BIF4002.pdf` — rapport complet du projet  
